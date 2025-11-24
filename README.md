@@ -47,7 +47,7 @@ Please have a look at the [Craftbeerpi4 Documentation](https://openbrewing.gitbo
 	
 Changelog:
 
-- 24.11.25: (0.1.0) add pyproject.toml to support pip 25.3+
+- 24.11.25: (0.1.1) add pyproject.toml to support pip 25.3+
 - 11.05.22: (0.0.10) Updated README (removed cbpi add)
 - 10.05.22: (0.0.9) Removed cbpi dependency
 - 10.02.22: (0.0.8): Fix to display correct power in actor button and mqtt when process is starting
