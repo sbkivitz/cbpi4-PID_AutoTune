@@ -7,11 +7,11 @@ with open(path.join(this_directory, 'README.md'), encoding='utf-8') as f:
     long_description = f.read()
 
 setup(name='cbpi4-PID_AutoTune',
-      version='0.0.10',
+      version='0.1.0',
       description='CraftBeerPi4 Kettle Logic for PID Auto Tune',
       author='Alexander Vollkopf',
       author_email='avollkopf@web.de',
-      url='https://github.com/avollkopf/cbpi4-PIDAutoTune',
+      url='https://github.com/PiBrewing/cbpi4-PIDAutoTune',
       license='GNU General Public License v3 (GPLv3)',
       include_package_data=True,
       package_data={
