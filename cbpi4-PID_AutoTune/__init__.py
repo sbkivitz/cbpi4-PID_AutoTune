@@ -19,13 +19,72 @@ from cbpi.api.dataclasses import NotificationAction, NotificationType
 
 @parameters([Property.Number(label = "Output_Step", configurable = True, default_value = 100, description="Default: 100. Sets the output when stepping up/down."),
              Property.Number(label = "Max_Output", configurable = True, default_value = 100, description="Default: 100. Sets the max power output."),
+             Property.Select(label = "SampleTime", options=[2, 5],
+                             description="Seconds between control decisions during the tune. Default: 5. "
+                                         "SET THIS TO MATCH the SampleTime of the logic you will actually run - "
+                                         "PIDHerms, PIDBoil or BM_PID. The gains this produces are only valid at "
+                                         "the sample time they were measured at, because PIDArduino folds it into "
+                                         "two of them (_Ki = ki * sampleTime, _Kd = kd / sampleTime). Tuning at 5 "
+                                         "and running at 2 leaves the integral at 0.40x and the derivative at "
+                                         "2.50x the tuned loop - sluggish and twitchy at the same time."),
              Property.Number(label = "lockback_seconds", configurable = True, default_value = 30, description="Default: 30. How far back to look for min/max temps.")])
 
 class PIDAutotune(CBPiKettleLogic):
 
+    # The sample time used when the property is absent or unusable. This was a
+    # bare local literal with no property at all, so every tune ran at 5 and
+    # nothing said so - the gains looked like plain numbers rather than numbers
+    # that only mean anything at one rate.
+    DEFAULT_SAMPLE_TIME = 5
+
+    # AutoTuner refuses a sample time below 1 second, and requires the lookback
+    # window to be at least one sample long.
+    MIN_SAMPLE_TIME = 1
+
     def __init__(self, cbpi, id, props):
         super().__init__(cbpi, id, props)
         self._logger = logging.getLogger(type(self).__name__)
+
+    def _sample_time(self):
+        """Seconds between control decisions during the tune. Never raises.
+
+        Parsed defensively like every other free-text-ish property on a kettle
+        logic: an exception here would escape into run() and kill the tune
+        after the element had already been driven, which is the worst moment
+        to fail.
+
+        Clamped to MIN_SAMPLE_TIME because AutoTuner raises ValueError below
+        1 second, and that exception would surface as "AutoTune Error" with no
+        hint that a sample time was the cause.
+        """
+        raw = self.props.get("SampleTime", self.DEFAULT_SAMPLE_TIME)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return self.DEFAULT_SAMPLE_TIME
+        if value != value or value in (float("inf"), float("-inf")):
+            return self.DEFAULT_SAMPLE_TIME
+        return max(self.MIN_SAMPLE_TIME, value)
+
+    @staticmethod
+    def rescale(ki, kd, tuned_at, used_at):
+        """The same loop expressed at a different sample time.
+
+        PIDArduino stores _Ki = ki * sampleTime and _Kd = kd / sampleTime, so
+        holding those products constant across a change of rate gives
+
+            ki' = ki * tuned_at / used_at
+            kd' = kd * used_at / tuned_at
+
+        Kp is not scaled and is returned unchanged by the caller.
+
+        Exposed as a static method so it can be tested directly against
+        PIDArduino's own internals rather than only through a notification
+        string.
+        """
+        if used_at <= 0 or tuned_at <= 0:
+            return ki, kd
+        return ki * tuned_at / used_at, kd * used_at / tuned_at
 
 
     async def autoOff(self):
@@ -64,7 +123,7 @@ class PIDAutotune(CBPiKettleLogic):
 
         self.cbpi.notify('PID AutoTune', 'AutoTune In Progress. Do not turn off Auto mode until AutoTuning is complete', NotificationType.INFO)
         
-        sampleTime = 5
+        sampleTime = self._sample_time()
         wait_time = 5
         outstep = float(self.props.get("Output_Step", 100))
         outmax = float(self.props.get("Max_Output", 100))
@@ -97,8 +156,30 @@ class PIDAutotune(CBPiKettleLogic):
                     atune.log('P: {0}'.format(params.Kp))
                     atune.log('I: {0}'.format(params.Ki))
                     atune.log('D: {0}'.format(params.Kd))
+                    atune.log('  (valid at SampleTime {0})'.format(sampleTime))
+                    # The same loop at the other offered sample time, so the
+                    # arithmetic never has to be done by hand. Scott tuned at
+                    # 5, ran at 2, and the gains were silently wrong until the
+                    # discrepancy was noticed days later.
+                    for other in (2, 5):
+                        if other == sampleTime:
+                            continue
+                        ki2, kd2 = self.rescale(
+                            params.Ki, params.Kd, sampleTime, other
+                        )
+                        atune.log(
+                            '  at SampleTime {0}: P: {1:.8f} I: {2:.8f} '
+                            'D: {3:.8f}'.format(other, params.Kp, ki2, kd2)
+                        )
                     if rule == "brewing":
-                        self.cbpi.notify('AutoTune has succeeded',"P Value: %.8f | I Value: %.8f | D Value: %.8f" % (params.Kp, params.Ki, params.Kd),action=[NotificationAction("OK")])
+                        self.cbpi.notify(
+                            'AutoTune has succeeded',
+                            "P: %.8f | I: %.8f | D: %.8f  (at SampleTime %g - "
+                            "the logic you run these in MUST use the same "
+                            "SampleTime, or rescale: see logs/autotune.log)"
+                            % (params.Kp, params.Ki, params.Kd, sampleTime),
+                            action=[NotificationAction("OK")],
+                        )
             elif atune.state == atune.STATE_FAILED:
                 atune.log("AutoTune has failed")
                 self.cbpi.notify('PID AutoTune Error', "PID AutoTune has failed",action=[NotificationAction("OK")])
