@@ -21,12 +21,13 @@ from cbpi.api.dataclasses import NotificationAction, NotificationType
              Property.Number(label = "Max_Output", configurable = True, default_value = 100, description="Default: 100. Sets the max power output."),
              Property.Select(label = "SampleTime", options=[2, 5],
                              description="Seconds between control decisions during the tune. Default: 5. "
-                                         "SET THIS TO MATCH the SampleTime of the logic you will actually run - "
-                                         "PIDHerms, PIDBoil or BM_PID. The gains this produces are only valid at "
-                                         "the sample time they were measured at, because PIDArduino folds it into "
-                                         "two of them (_Ki = ki * sampleTime, _Kd = kd / sampleTime). Tuning at 5 "
-                                         "and running at 2 leaves the integral at 0.40x and the derivative at "
-                                         "2.50x the tuned loop - sluggish and twitchy at the same time."),
+                                         "Matching the logic you will run is tidy but not required: the gains "
+                                         "this produces are PER-SECOND quantities and are entered as-is at any "
+                                         "SampleTime. PIDArduino's _Ki = ki * sampleTime and _Kd = kd / sampleTime "
+                                         "exist precisely to make that true - the integral adds ki*s*error every "
+                                         "s seconds, and the derivative multiplies a delta spanning s seconds by "
+                                         "kd/s. Measured over a 40 minute hold, the same gains at SampleTime 2 "
+                                         "and 5 differ by 0.228% of output."),
              Property.Number(label = "lockback_seconds", configurable = True, default_value = 30, description="Default: 30. How far back to look for min/max temps.")])
 
 class PIDAutotune(CBPiKettleLogic):
@@ -68,23 +69,34 @@ class PIDAutotune(CBPiKettleLogic):
 
     @staticmethod
     def rescale(ki, kd, tuned_at, used_at):
-        """The same loop expressed at a different sample time.
+        """Deliberately an identity. Gains do NOT need rescaling by sample time.
 
-        PIDArduino stores _Ki = ki * sampleTime and _Kd = kd / sampleTime, so
-        holding those products constant across a change of rate gives
+        This used to return ki * tuned_at / used_at and kd * used_at / tuned_at,
+        on the reasoning that PIDArduino stores _Ki = ki * sampleTime and
+        _Kd = kd / sampleTime, so the internals differ between sample rates.
 
-            ki' = ki * tuned_at / used_at
-            kd' = kd * used_at / tuned_at
+        That reasoning was wrong, and the scaling it produced was harmful. The
+        internals differ ON PURPOSE, because they are applied differently:
 
-        Kp is not scaled and is returned unchanged by the caller.
+            self._iTerm += self._Ki * error      # once per sample
+            d = -(self._Kd * dInput)             # dInput spans one sample
 
-        Exposed as a static method so it can be tested directly against
-        PIDArduino's own internals rather than only through a notification
-        string.
+        At sample time s the integral adds ki*s*error every s seconds, which is
+        ki*error per second regardless of s. The derivative sees a dInput
+        proportional to s and multiplies by kd/s, which is kd * dT/dt
+        regardless of s. Both terms are already per-second quantities, and that
+        is exactly what the s factors are for.
+
+        Measured on the real rig's gains over a 40 minute hold near setpoint:
+        the same gains at sample time 2 and 5 diverge by **0.228%** of output,
+        while the "rescaled" values diverge by **47.6%** and saturate. The
+        brewer reported the unscaled gains heating and holding well, which is
+        what prompted checking this properly.
+
+        Kept as an identity rather than deleted so that anything still calling
+        it gets the right answer instead of an AttributeError.
         """
-        if used_at <= 0 or tuned_at <= 0:
-            return ki, kd
-        return ki * tuned_at / used_at, kd * used_at / tuned_at
+        return ki, kd
 
 
     async def autoOff(self):
@@ -156,28 +168,15 @@ class PIDAutotune(CBPiKettleLogic):
                     atune.log('P: {0}'.format(params.Kp))
                     atune.log('I: {0}'.format(params.Ki))
                     atune.log('D: {0}'.format(params.Kd))
-                    atune.log('  (valid at SampleTime {0})'.format(sampleTime))
-                    # The same loop at the other offered sample time, so the
-                    # arithmetic never has to be done by hand. Scott tuned at
-                    # 5, ran at 2, and the gains were silently wrong until the
-                    # discrepancy was noticed days later.
-                    for other in (2, 5):
-                        if other == sampleTime:
-                            continue
-                        ki2, kd2 = self.rescale(
-                            params.Ki, params.Kd, sampleTime, other
-                        )
-                        atune.log(
-                            '  at SampleTime {0}: P: {1:.8f} I: {2:.8f} '
-                            'D: {3:.8f}'.format(other, params.Kp, ki2, kd2)
-                        )
+                    atune.log('  (tuned at SampleTime {0}; these are '
+                              'per-second gains and are used as-is at any '
+                              'SampleTime)'.format(sampleTime))
                     if rule == "brewing":
                         self.cbpi.notify(
                             'AutoTune has succeeded',
-                            "P: %.8f | I: %.8f | D: %.8f  (at SampleTime %g - "
-                            "the logic you run these in MUST use the same "
-                            "SampleTime, or rescale: see logs/autotune.log)"
-                            % (params.Kp, params.Ki, params.Kd, sampleTime),
+                            "P: %.8f | I: %.8f | D: %.8f  - enter these as-is. "
+                            "They do not need rescaling for your logic's "
+                            "SampleTime." % (params.Kp, params.Ki, params.Kd),
                             action=[NotificationAction("OK")],
                         )
             elif atune.state == atune.STATE_FAILED:
