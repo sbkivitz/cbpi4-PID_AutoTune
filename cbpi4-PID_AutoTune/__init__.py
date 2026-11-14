@@ -32,10 +32,7 @@ from cbpi.api.dataclasses import NotificationAction, NotificationType
 
 class PIDAutotune(CBPiKettleLogic):
 
-    # The sample time used when the property is absent or unusable. This was a
-    # bare local literal with no property at all, so every tune ran at 5 and
-    # nothing said so - the gains looked like plain numbers rather than numbers
-    # that only mean anything at one rate.
+    # The sample time used when the property is absent or unusable.
     DEFAULT_SAMPLE_TIME = 5
 
     # AutoTuner refuses a sample time below 1 second, and requires the lookback
@@ -71,12 +68,9 @@ class PIDAutotune(CBPiKettleLogic):
     def rescale(ki, kd, tuned_at, used_at):
         """Deliberately an identity. Gains do NOT need rescaling by sample time.
 
-        This used to return ki * tuned_at / used_at and kd * used_at / tuned_at,
-        on the reasoning that PIDArduino stores _Ki = ki * sampleTime and
-        _Kd = kd / sampleTime, so the internals differ between sample rates.
-
-        That reasoning was wrong, and the scaling it produced was harmful. The
-        internals differ ON PURPOSE, because they are applied differently:
+        PIDArduino stores _Ki = ki * sampleTime and _Kd = kd / sampleTime, so
+        its internals differ between sample rates - ON PURPOSE, because they
+        are applied differently:
 
             self._iTerm += self._Ki * error      # once per sample
             d = -(self._Kd * dInput)             # dInput spans one sample
@@ -87,14 +81,13 @@ class PIDAutotune(CBPiKettleLogic):
         regardless of s. Both terms are already per-second quantities, and that
         is exactly what the s factors are for.
 
-        Measured on the real rig's gains over a 40 minute hold near setpoint:
-        the same gains at sample time 2 and 5 diverge by **0.228%** of output,
-        while the "rescaled" values diverge by **47.6%** and saturate. The
-        brewer reported the unscaled gains heating and holding well, which is
-        what prompted checking this properly.
+        Scaling them anyway (ki * tuned_at / used_at, kd * used_at / tuned_at)
+        is harmful. On the real rig's gains over a 40 minute hold near
+        setpoint, the same gains at sample time 2 and 5 diverge by **0.228%**
+        of output, while "rescaled" values diverge by **47.6%** and saturate.
 
-        Kept as an identity rather than deleted so that anything still calling
-        it gets the right answer instead of an AttributeError.
+        An identity rather than no method at all, so that anything calling it
+        gets the right answer instead of an AttributeError.
         """
         return ki, kd
 
