@@ -2,6 +2,7 @@ from time import localtime, strftime
 import time
 import math
 import logging
+import inspect
 import io
 from collections import deque
 from collections import namedtuple
@@ -17,6 +18,40 @@ from typing import KeysView
 from voluptuous.schema_builder import message
 from cbpi.api.dataclasses import NotificationAction, NotificationType
 
+try:
+    # Present on forks with a pluggable clock, which lets a tune be rehearsed
+    # on a simulator faster than real time. On hardware it is real time.
+    # Optional, so the plugin still loads on a CraftBeerPi without it.
+    from cbpi.api import clock
+except ImportError:  # pragma: no cover - depends on the host installation
+    class _RealClock:
+        @staticmethod
+        def now():
+            return time.time()
+
+        @staticmethod
+        def monotonic():
+            return time.monotonic()
+
+        @staticmethod
+        async def sleep(seconds):
+            await asyncio.sleep(max(0.0, seconds))
+
+    clock = _RealClock()
+
+
+def _notify_kept(cbpi, title, message, type, action):
+    """notify(..., keep=True) where CraftBeerPi can keep a prompt for every
+    page until it is answered, plain notify where it cannot."""
+    try:
+        keeps = "keep" in inspect.signature(cbpi.notify).parameters
+    except (TypeError, ValueError):
+        keeps = False
+    if keeps:
+        return cbpi.notify(title, message, type, action=action, keep=True)
+    return cbpi.notify(title, message, type, action=action)
+
+
 @parameters([Property.Number(label = "Output_Step", configurable = True, default_value = 100, description="Default: 100. Sets the output when stepping up/down."),
              Property.Number(label = "Max_Output", configurable = True, default_value = 100, description="Default: 100. Sets the max power output."),
              Property.Select(label = "SampleTime", options=[2, 5],
@@ -28,7 +63,24 @@ from cbpi.api.dataclasses import NotificationAction, NotificationType
                                          "s seconds, and the derivative multiplies a delta spanning s seconds by "
                                          "kd/s. Measured over a 40 minute hold, the same gains at SampleTime 2 "
                                          "and 5 differ by 0.228% of output."),
-             Property.Number(label = "lockback_seconds", configurable = True, default_value = 30, description="Default: 30. How far back to look for min/max temps.")])
+             Property.Number(label = "lockback_seconds", configurable = True, default_value = 30, description="Default: 30. How far back to look for min/max temps."),
+             Property.Number(label = "Max_Tune_Minutes", configurable = True, default_value = 300,
+                             description="Default: 300 (5 hours). The longest a tune may run, in minutes. If it "
+                                         "hasn't finished by then, the heater goes off, the tune ends and a "
+                                         "notification says so. With 20-40 L and a 5.5 kW element a tune takes "
+                                         "about 1 to 3 hours at a mash temperature, nearer 4 at a low target "
+                                         "with the pump off. Raise it for a bigger fill."),
+             Property.Number(label = "Max_Peak_Gap_Minutes", configurable = True, default_value = 60,
+                             description="Default: 60. The longest the tune may wait for the temperature to turn, "
+                                         "in minutes. A tune heats past the target, lets it cool back below, and "
+                                         "heats again; each top and bottom is a peak. If no new peak comes this "
+                                         "long after the last one, or after the start, the heater goes off, the "
+                                         "tune ends and a notification says so. A probe stuck below the target "
+                                         "makes no peaks, so it can keep the heater on for this long. With 20-40 L "
+                                         "and a 5.5 kW element, heating up and the slowest swing at a mash "
+                                         "temperature take up to about 50 minutes. Raise it for a bigger fill, a "
+                                         "target below about 130 F (55 C) with the pump off, or a lower "
+                                         "Output_Step or Max_Output.")])
 
 class PIDAutotune(CBPiKettleLogic):
 
@@ -39,9 +91,157 @@ class PIDAutotune(CBPiKettleLogic):
     # window to be at least one sample long.
     MIN_SAMPLE_TIME = 1
 
+    # What run() takes each setting left empty as (blank_defaults). None of
+    # them depends on the temperature unit.
+    BLANK = {
+        "Output_Step": 100,
+        "Max_Output": 100,
+        "SampleTime": DEFAULT_SAMPLE_TIME,
+        "lockback_seconds": 30,
+        "Max_Tune_Minutes": 300,
+        "Max_Peak_Gap_Minutes": 60,
+    }
+
+    # How old a reading may be when the sensor's state doesn't say: the core's
+    # own floor (SensorController.DEFAULT_MAX_AGE). Normally get_sensor_value()
+    # gives max_age from the sensor's own publish interval.
+    MAX_SENSOR_AGE = 30
+
     def __init__(self, cbpi, id, props):
         super().__init__(cbpi, id, props)
         self._logger = logging.getLogger(type(self).__name__)
+
+    @classmethod
+    def blank_defaults(cls, unit):
+        """What run() uses for each setting left empty: BLANK, in either unit.
+        run() reads the same table, so the two can't drift apart."""
+        return dict(cls.BLANK)
+
+    @staticmethod
+    def _empty(raw):
+        return raw is None or (isinstance(raw, str) and not raw.strip())
+
+    @staticmethod
+    def _finite(raw):
+        """`raw` as a float, or None when it isn't a finite number."""
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def _number(self, label):
+        """A number setting: BLANK's value when it is empty, else float() of it."""
+        raw = self.props.get(label)
+        if self._empty(raw):
+            return float(self.BLANK[label])
+        return float(raw)
+
+    def _minutes(self, label):
+        """A time limit in seconds. Empty, it is BLANK's; a value that isn't a
+        number of minutes above 0 is BLANK's too, and the brewer is told, so a
+        mistyped limit can't switch the limit off."""
+        raw = self.props.get(label)
+        default = float(self.BLANK[label])
+        if self._empty(raw):
+            return default * 60
+        value = self._finite(raw)
+        if value is None or value <= 0:
+            self.cbpi.notify(
+                'PID AutoTune',
+                "{} is set to {!r}, which isn't a number of minutes above 0, so {:g} "
+                "is used.".format(label, raw, default),
+                NotificationType.WARNING)
+            return default * 60
+        return value * 60
+
+    def _kettle_name(self):
+        return getattr(getattr(self, "kettle", None), "name", None) or "kettle"
+
+    def _reading(self):
+        """(temperature, None), or (None, why) when the kettle's probe gives
+        nothing to heat on: no reading, a value that isn't a finite number, or
+        one CraftBeerPi reports as stale - older than the max_age that
+        get_sensor_value() gives with it, as PIDBoil, PID_HERMS and Hysteresis
+        judge it. A sensor that gives no age is taken as it is, as they take
+        it."""
+        try:
+            state = self.get_sensor_value(self.kettle.sensor)
+        except Exception:  # noqa: BLE001 - no reading is an answer, not a crash
+            state = None
+        if not isinstance(state, dict):
+            return None, "its sensor isn't giving a reading"
+        raw = state.get("value")
+        value = self._finite(raw)
+        if value is None:
+            return None, "its sensor reads {!r}, which isn't a temperature".format(raw)
+        if state.get("age") is not None:
+            age = self._finite(state.get("age"))
+            limit = self._finite(state.get("max_age"))
+            if limit is None or limit <= 0:
+                limit = self.MAX_SENSOR_AGE
+            if age is None:
+                return None, "CraftBeerPi can't say how old its sensor's reading is"
+            if age > limit:
+                return None, ("its sensor has had no new reading for {:.0f} seconds, and CraftBeerPi "
+                              "counts one over {:.0f} seconds old as out of date".format(age, limit))
+        return value, None
+
+    def _target(self):
+        """(the kettle's target as a whole number, None), or (None, why) when it
+        isn't a finite number."""
+        raw = self.get_kettle_target_temp(self.id)
+        value = self._finite(raw)
+        if value is None:
+            return None, "its target, {!r}, isn't a temperature".format(raw)
+        return int(value), None
+
+    async def _end_tune(self, why, atune=None, heating=True):
+        """End the tune with the element off and the brewer told why.
+
+        The element goes off first, before anything that could fail. Then the
+        kettle's logic is stopped as AUTO off stops it, once this run has
+        finished (_stop_when_done)."""
+        self.finished = True
+        await self.actor_off(self.heater)
+        if heating:
+            message = "AutoTune on {} ended and switched its heater off: {}.".format(self._kettle_name(), why)
+        else:
+            message = "AutoTune on {} didn't start, and its heater is off: {}.".format(self._kettle_name(), why)
+        self._logger.warning("%s", message)
+        if atune is not None:
+            try:
+                atune.log(message)
+            except Exception:  # noqa: BLE001 - the tune's own log file is optional
+                pass
+        try:
+            _notify_kept(self.cbpi, 'PID AutoTune', message, NotificationType.ERROR,
+                         [NotificationAction("OK")])
+        except Exception as e:  # noqa: BLE001 - telling must not stop the stop
+            self._logger.error("Could not send the AutoTune notification: %s", e)
+        self._stop_when_done()
+
+    def _stop_when_done(self):
+        """Stop the kettle's logic through CraftBeerPi, as AUTO off does, once
+        this run's task has finished: the logic then shows stopped, and every
+        page is told.
+
+        CraftBeerPi's stop cancels the logic's task and waits for it, which the
+        task can't do to itself, so it is asked for from the task's end. Only
+        while this run is still the kettle's logic and still shown running."""
+        task = getattr(self, "task", None)
+        if task is None:
+            return
+
+        def stop(done):
+            try:
+                kettle = self.cbpi.kettle.find_by_id(self.id)
+                if getattr(kettle, "instance", None) is self and self.state:
+                    self._stopping = done.get_loop().create_task(self.cbpi.kettle.stop(self.id))
+            except Exception as e:  # noqa: BLE001
+                self._logger.error("Could not stop the kettle's logic after AutoTune ended: %s", e)
+
+        task.add_done_callback(stop)
 
     def _sample_time(self):
         """Seconds between control decisions during the tune. Never raises.
@@ -108,8 +308,14 @@ class PIDAutotune(CBPiKettleLogic):
         self.heater = self.kettle.heater
         self.TEMP_UNIT=self.get_config_value("TEMP_UNIT", "C")
         fixedtarget = 67 if self.TEMP_UNIT == "C" else 153
-        setpoint = int(self.get_kettle_target_temp(self.id))
-        current_value=self.get_sensor_value(self.kettle.sensor).get("value")
+        setpoint, why = self._target()
+        if why is not None:
+            await self._end_tune(why, heating=False)
+            return
+        current_value, why = self._reading()
+        if why is not None:
+            await self._end_tune(why, heating=False)
+            return
 
         if setpoint == 0:
             if fixedtarget < current_value:
@@ -130,12 +336,15 @@ class PIDAutotune(CBPiKettleLogic):
         
         sampleTime = self._sample_time()
         wait_time = 5
-        outstep = float(self.props.get("Output_Step", 100))
-        outmax = float(self.props.get("Max_Output", 100))
-        lookbackSec = float(self.props.get("lockback_seconds", 30))
+        outstep = self._number("Output_Step")
+        outmax = self._number("Max_Output")
+        lookbackSec = self._number("lockback_seconds")
+        max_tune = self._minutes("Max_Tune_Minutes")
+        max_gap = self._minutes("Max_Peak_Gap_Minutes")
         heat_percent_old = 0
         try:
-            atune = AutoTuner(setpoint, outstep, sampleTime, lookbackSec, 0, outmax)
+            atune = AutoTuner(setpoint, outstep, sampleTime, lookbackSec, 0, outmax,
+                              getTimeMs=lambda: clock.monotonic() * 1000.0)
         except Exception as e:
             self.cbpi.notify('PID autoTune', 'AutoTune Error: {}'.format(str(e)),NotificationType.ERROR)
             atune.log(str(e))
@@ -143,17 +352,40 @@ class PIDAutotune(CBPiKettleLogic):
         atune.log("AutoTune will now begin")
 
         try:
+            # Both limits count brewing time from here: the whole tune, and
+            # the wait for each peak, the first one included.
+            started = last_peak = clock.monotonic()
+            peaks = 0
+            ended = None
             await self.actor_on(self.heater, heat_percent_old)
-            while self.running == True and not atune.run(self.get_sensor_value(self.kettle.sensor).get("value")):
+            while self.running == True:
+                reading, ended = self._reading()
+                if ended is not None or atune.run(reading):
+                    break
+                now = clock.monotonic()
+                if atune.peakCount != peaks:
+                    peaks, last_peak = atune.peakCount, now
+                if now - started >= max_tune:
+                    ended = ("it has run for {:.0f} minutes without finishing, the most "
+                             "Max_Tune_Minutes allows".format((now - started) / 60))
+                    break
+                if now - last_peak >= max_gap:
+                    ended = ("the temperature hasn't turned for {:.0f} minutes, the most "
+                             "Max_Peak_Gap_Minutes allows. A probe stuck below the target does "
+                             "this, and so does a kettle slower than that: check the probe, and "
+                             "raise Max_Peak_Gap_Minutes for a slow kettle".format((now - last_peak) / 60))
+                    break
                 heat_percent = atune.output
                 if heat_percent != heat_percent_old:
                     await self.actor_set_power(self.heater,heat_percent)
                     heat_percent_old = heat_percent
-                await asyncio.sleep(sampleTime)
+                await clock.sleep(sampleTime)
 
             await self.autoOff()
-        
-            if atune.state == atune.STATE_SUCCEEDED:
+
+            if ended is not None:
+                await self._end_tune(ended, atune)
+            elif atune.state == atune.STATE_SUCCEEDED:
                 atune.log("AutoTune has succeeded")
                 for rule in atune.tuningRules:
                     params = atune.getPIDParameters(rule)
@@ -257,6 +489,10 @@ class AutoTuner(object):
 	@property
 	def output(self):
 		return self._output
+
+	@property
+	def peakCount(self):
+		return self._peakCount
 
 	@property
 	def tuningRules(self):

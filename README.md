@@ -20,6 +20,14 @@ Please have a look at the [Craftbeerpi4 Documentation](https://openbrewing.gitbo
 	- Output Step: Defines the output power in % used for steps to ramp up to a temperature. Default is 100%.
 	- Max Outpuz: Defines the maximum outpout power in % you are using with your system. Default is 100%.
 	- Lockback Seconds: Defines the time in seconds how far the routine is locking back to identify temperature peaks. 30 seconds is typical. If you experience issues, increase the time (e.g. 60 seconds)
+	- Max Tune Minutes: The longest a tune may run, in minutes. If it hasn't finished by then, the heater goes off, the tune ends and a notification says so. Default 300 (5 hours). With 20-40 L of water and a 5.5 kW element a tune takes about 1 to 3 hours at a mash temperature, nearer 4 at a low target with the pump off. Raise it for a bigger fill.
+	- Max Peak Gap Minutes: The longest the tune may wait for the temperature to turn, in minutes. Each top and bottom of the swing is a peak. If no new peak comes this long after the last one, or after the start, the heater goes off, the tune ends and a notification says so. Default 60. With 20-40 L and a 5.5 kW element, heating up and the slowest swing at a mash temperature take up to about 50 minutes. Raise it for a bigger fill, a target below about 130 °F (55 °C) with the pump off, or a lower Output Step or Max Output.
+	- A setting left empty is taken as its default. CraftBeerPi can show those values on the Hardware page (blank_defaults).
+
+- When the tune ends early:
+	- Before heating and at every reading, AutoTune checks the kettle's probe. No reading, a reading that isn't a number (such as "nan"), or one CraftBeerPi reports as out of date ends the tune at once, with the heater off and a notification saying why. A kettle target that isn't a number does the same before heating starts.
+	- A probe that freezes on a plausible number below the target isn't detected. The tune keeps heating until Max Peak Gap Minutes or Max Tune Minutes ends it.
+	- A tune ended this way switches the heater off and stops the kettle's logic, as switching AUTO off does.
 	
 - Hardware Setup:
 	- After installation go to hardware settings
@@ -47,6 +55,7 @@ Please have a look at the [Craftbeerpi4 Documentation](https://openbrewing.gitbo
 	
 Changelog:
 
+- 16.11.26: (0.1.1.post4, this fork) A tune ends, with the heater off and a notification, on a reading that isn't a number or that CraftBeerPi reports as out of date, after Max_Tune_Minutes, or after Max_Peak_Gap_Minutes without a new peak. The tune waits on CraftBeerPi's clock, the same as real time on hardware. An empty setting is taken as its default, and blank_defaults() says what that is.
 - 13.11.26: (0.1.1.post3, this fork) Comments describe the code. No change in behaviour.
 - 24.11.25: (0.1.1) add pyproject.toml to support pip 25.3+
 - 11.05.22: (0.0.10) Updated README (removed cbpi add)
