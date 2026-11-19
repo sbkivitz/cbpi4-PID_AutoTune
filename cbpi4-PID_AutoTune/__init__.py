@@ -131,11 +131,15 @@ class PIDAutotune(CBPiKettleLogic):
         return value if math.isfinite(value) else None
 
     def _number(self, label):
-        """A number setting: BLANK's value when it is empty, else float() of it."""
+        """A number setting: BLANK's value when it is empty. One that isn't a
+        finite number raises ValueError, naming the setting."""
         raw = self.props.get(label)
         if self._empty(raw):
             return float(self.BLANK[label])
-        return float(raw)
+        value = self._finite(raw)
+        if value is None:
+            raise ValueError("{} is set to {!r}, which isn't a number".format(label, raw))
+        return value
 
     def _minutes(self, label):
         """A time limit in seconds. Empty, it is BLANK's; a value that isn't a
@@ -332,23 +336,24 @@ class PIDAutotune(CBPiKettleLogic):
             await self.stop()
             pass
 
-        self.cbpi.notify('PID AutoTune', 'AutoTune In Progress. Do not turn off Auto mode until AutoTuning is complete', NotificationType.INFO)
-        
         sampleTime = self._sample_time()
         wait_time = 5
-        outstep = self._number("Output_Step")
-        outmax = self._number("Max_Output")
-        lookbackSec = self._number("lockback_seconds")
         max_tune = self._minutes("Max_Tune_Minutes")
         max_gap = self._minutes("Max_Peak_Gap_Minutes")
         heat_percent_old = 0
         try:
+            outstep = self._number("Output_Step")
+            outmax = self._number("Max_Output")
+            lookbackSec = self._number("lockback_seconds")
             atune = AutoTuner(setpoint, outstep, sampleTime, lookbackSec, 0, outmax,
                               getTimeMs=lambda: clock.monotonic() * 1000.0)
-        except Exception as e:
-            self.cbpi.notify('PID autoTune', 'AutoTune Error: {}'.format(str(e)),NotificationType.ERROR)
-            atune.log(str(e))
-            await self.autoOff()
+        except Exception as e:  # noqa: BLE001 - a setting the tune can't use is refused by raising
+            # Ended as a reading it can't use is, before anything heats: the
+            # brewer is told which setting, and the kettle's logic is stopped
+            # as AUTO off stops it.
+            await self._end_tune(str(e), heating=False)
+            return
+        self.cbpi.notify('PID AutoTune', 'AutoTune In Progress. Do not turn off Auto mode until AutoTuning is complete', NotificationType.INFO)
         atune.log("AutoTune will now begin")
 
         try:
@@ -448,13 +453,15 @@ class AutoTuner(object):
 		if setpoint is None:
 			raise ValueError('Kettle setpoint must be specified')
 		if outputstep < 1:
-			raise ValueError('Output step % must be greater or equal to 1')
+			raise ValueError('Output_Step is {:g}, and it has to be at least 1'.format(outputstep))
 		if sampleTimeSec < 1:
 			raise ValueError('Sample Time Seconds must be greater or equal to 1')
 		if lookbackSec < sampleTimeSec:
-			raise ValueError('Lookback Seconds must be greater or equal to Sample Time Seconds (5)')
+			raise ValueError('lockback_seconds is {:g}, and it has to be at least SampleTime, {:g}'.format(
+				lookbackSec, sampleTimeSec))
 		if outputMin >= outputMax:
-			raise ValueError('Min Output % must be less than Max Output %')
+			raise ValueError('Max_Output is {:g}, and it has to be more than {:g}'.format(
+				outputMax, outputMin))
 
 		self._inputs = deque(maxlen=round(lookbackSec / sampleTimeSec))
 		self._sampleTime = sampleTimeSec * 1000
