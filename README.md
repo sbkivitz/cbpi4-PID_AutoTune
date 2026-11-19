@@ -27,6 +27,7 @@ Please have a look at the [Craftbeerpi4 Documentation](https://openbrewing.gitbo
 - When the tune ends early:
 	- Before heating and at every reading, AutoTune checks the kettle's probe. No reading, a reading that isn't a number (such as "nan"), or one CraftBeerPi reports as out of date ends the tune at once, with the heater off and a notification saying why. A kettle target that isn't a number does the same before heating starts.
 	- A setting the tune can't use - a lockback_seconds shorter than SampleTime, an Output_Step below 1, a Max_Output of 0 or less, or one that isn't a number - ends it before heating, with the heater off and a notification naming the setting.
+	- A kettle already above its target, or with no target and above the 67 °C (153 °F) the tune would use instead, ends it before heating, with the heater off and a notification giving both temperatures.
 	- A probe that freezes on a plausible number below the target isn't detected. The tune keeps heating until Max Peak Gap Minutes or Max Tune Minutes ends it.
 	- A tune ended this way switches the heater off and stops the kettle's logic, as switching AUTO off does.
 	
@@ -56,6 +57,7 @@ Please have a look at the [Craftbeerpi4 Documentation](https://openbrewing.gitbo
 	
 Changelog:
 
+- 18.11.26: (0.1.1.post6, this fork) A kettle already above its target, or with no target and above the 67 °C (153 °F) used instead, ends the tune before heating, as a setting it can't use does: the heater off, a notification giving both temperatures, and the kettle's logic stopped as switching AUTO off does. Before, a target below the kettle's temperature was reported as above it; either way the brewer was then told the tune was stopped by hand, and the kettle went on showing AUTO with nothing running.
 - 18.11.26: (0.1.1.post5, this fork) A setting the tune can't use ends it before heating, as a reading it can't use does: the heater off, a notification naming the setting, and the kettle's logic stopped as switching AUTO off does. Before, the brewer was told the tune was in progress, then that it was stopped by hand, and the kettle went on showing AUTO with nothing running.
 - 16.11.26: (0.1.1.post4, this fork) A tune ends, with the heater off and a notification, on a reading that isn't a number or that CraftBeerPi reports as out of date, after Max_Tune_Minutes, or after Max_Peak_Gap_Minutes without a new peak. The tune waits on CraftBeerPi's clock, the same as real time on hardware. An empty setting is taken as its default, and blank_defaults() says what that is.
 - 13.11.26: (0.1.1.post3, this fork) Comments describe the code. No change in behaviour.

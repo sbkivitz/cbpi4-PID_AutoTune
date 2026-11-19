@@ -162,6 +162,10 @@ class PIDAutotune(CBPiKettleLogic):
     def _kettle_name(self):
         return getattr(getattr(self, "kettle", None), "name", None) or "kettle"
 
+    def _degrees(self, value):
+        """A temperature as the brewer reads it: to a tenth, in the server's unit."""
+        return "{:g} °{}".format(round(value, 1), self.TEMP_UNIT)
+
     def _reading(self):
         """(temperature, None), or (None, why) when the kettle's probe gives
         nothing to heat on: no reading, a value that isn't a finite number, or
@@ -321,20 +325,30 @@ class PIDAutotune(CBPiKettleLogic):
             await self._end_tune(why, heating=False)
             return
 
+        # A kettle above its target, or above the fallback when it has none,
+        # ends the tune before anything heats, as a reading it can't use does.
         if setpoint == 0:
             if fixedtarget < current_value:
-                self.cbpi.notify('PID AutoTune', 'You have not defined a target temp and current temp is above fallback value of {} °{}. Please choose target temp above current temp or wait until systme has cooled down.'.format(fixedtarget,self.TEMP_UNIT), NotificationType.ERROR)
-                await self.actor_off(self.heater)
-                await self.stop()
+                await self._end_tune(
+                    "it has no target, and the kettle's {} is above the {} it uses when there "
+                    "is none. Set a target above the kettle's temperature, or let the kettle "
+                    "cool to {}, and start AutoTune again".format(
+                        self._degrees(current_value), self._degrees(fixedtarget),
+                        self._degrees(fixedtarget)),
+                    heating=False)
+                return
             self.cbpi.notify('PID AutoTune', 'You have not defined a target temp. System will set target to {} °{} and start AutoTune'.format(fixedtarget,self.TEMP_UNIT), NotificationType.WARNING)
             setpoint=fixedtarget
             await self.set_target_temp(self.id,setpoint)
     
         if setpoint < current_value:
-            self.cbpi.notify('PID AutoTune', 'Your target temp is above the current temp. Choose a higher setpoint or wait until temp temp is below target temp and restart AutoTune', NotificationType.ERROR)
-            await self.actor_off(self.heater)
-            await self.stop()
-            pass
+            await self._end_tune(
+                "its target, {}, is below the kettle's {}. Set a higher target, or let the "
+                "kettle cool to {}, and start AutoTune again".format(
+                    self._degrees(setpoint), self._degrees(current_value),
+                    self._degrees(setpoint)),
+                heating=False)
+            return
 
         sampleTime = self._sample_time()
         wait_time = 5
